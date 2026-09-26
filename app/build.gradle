@@ -1,0 +1,25 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'local.qwenimage.mobile'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'local.qwenimage.mobile'
+        minSdk 29
+        targetSdk 34
+        versionCode 5
+        versionName '1.4'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
