@@ -3,6 +3,7 @@ package local.qwenimage.mobile;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.net.Uri;
+import android.webkit.MimeTypeMap;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -57,9 +58,15 @@ final class ComfyClient {
     }
 
     byte[] generate(boolean edit, String prompt, Uri reference, Uri reference2, int width, int height,
-                    int steps, long seed, String encoder, StatusListener listener) throws Exception {
+                    int steps, long seed, String encoder, int unetVariant, StatusListener listener) throws Exception {
         if (listener.isCanceled()) throw new InterruptedException("任务已取消");
         JSONObject workflow = loadWorkflow(edit ? "qwen_edit_api.json" : "qwen_t2i_api.json");
+        if (unetVariant == 2) {
+            workflow.getJSONObject("1").getJSONObject("inputs")
+                    .put("unet_name", "qwen-image-2.1-UC-int8_convrot.safetensors");
+        } else if (unetVariant != 0) {
+            throw new IllegalArgumentException("未知的 UNet 模型选项");
+        }
         workflow.getJSONObject("2").getJSONObject("inputs").put("clip_name", encoder);
         String editInstruction = reference2 == null
                 ? "以<image1>为原图，按以下要求编辑，保留未要求修改的内容：\n"
@@ -232,6 +239,10 @@ final class ComfyClient {
     private String uploadImage(Uri uri) throws Exception {
         ContentResolver resolver = context.getContentResolver();
         String mime = resolver.getType(uri);
+        if (mime == null && "file".equals(uri.getScheme())) {
+            String extension = MimeTypeMap.getFileExtensionFromUrl(uri.toString());
+            mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension);
+        }
         if (mime == null || !mime.startsWith("image/")) throw new IOException("请选择图片文件");
         String suffix = mime.equals("image/png") ? ".png" : mime.equals("image/webp") ? ".webp" : ".jpg";
         String filename = "qwen_mobile_" + UUID.randomUUID().toString().replace("-", "") + suffix;

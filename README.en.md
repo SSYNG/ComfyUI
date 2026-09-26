@@ -2,11 +2,14 @@
 
 [简体中文](README.md) · [MIT License](LICENSE)
 
-TangHua is an Android client for drawing with a ComfyUI server on your local network. The phone handles prompts, the task queue, and results; your computer runs inference. The bundled workflows target **Qwen Image 2.1** with an INT8 image model and W4A8 text encoders.
+TangHua is an Android client for drawing with a ComfyUI server on your local network. The phone handles prompts, the task queue, and results; your computer runs inference. The bundled workflows target **Qwen Image 2.1** and default to an INT8 image model and W4A8 text encoders.
 
 ## Features
 
 - Text to image with aspect ratio, sampling steps, seed, and standard or Heretic W4A8 encoder options.
+- Both text generation and reference editing can use the standard or Uncensored INT8 ConvRot UNet. The Uncensored model and Heretic W4A8 text encoder are selected by default.
+- Text generation offers separate aspect ratio and resolution choices, from 0.5K to 2K on the long edge.
+- Pick reference images from the system photo library. Swipe a history item left to delete its app copy or reuse all saved task parameters; tap a result for a full-screen preview.
 - Reference image editing with one required primary image and an optional second image, both previewed in the app. The primary image determines the base output dimensions.
 - A separate full screen prompt editor with its own scrolling, character count, jump controls, and a locally saved draft.
 - A serial task queue: one submitted task at a time. Pending tasks can be dragged to reorder or removed; a running task can be canceled.

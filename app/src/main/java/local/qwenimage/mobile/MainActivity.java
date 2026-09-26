@@ -26,11 +26,13 @@ import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.View;
 import android.view.DragEvent;
+import android.view.MotionEvent;
 import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -64,6 +66,7 @@ public final class MainActivity extends Activity {
     private final ExecutorService saveWorker = Executors.newSingleThreadExecutor();
     private final ArrayList<DrawTask> pendingTasks = new ArrayList<>();
     private final ArrayList<ResultHistory.Entry> resultHistory = new ArrayList<>();
+    private final ArrayList<String> removedHistoryIds = new ArrayList<>();
 
     private EditText serverField;
     private TextView promptPreview;
@@ -73,8 +76,10 @@ public final class MainActivity extends Activity {
     private EditText stepsField;
     private EditText seedField;
     private Spinner modeField;
-    private Spinner sizeField;
+    private Spinner aspectField;
+    private Spinner resolutionField;
     private Spinner encoderField;
+    private Spinner unetField;
     private Button pickButton;
     private Button pickButton2;
     private Button generateButton;
@@ -111,6 +116,11 @@ public final class MainActivity extends Activity {
     private boolean savingImage;
     private int resultSelectionVersion;
     private DrawTask activeTask;
+    private View openHistoryRow;
+    private static final String[] ASPECT_NAMES = {"方形 1:1", "竖幅 2:3", "横幅 3:2", "竖幅 3:4",
+            "横幅 4:3", "竖幅 9:16", "横幅 16:9"};
+    private static final int[][] ASPECTS = {{1, 1}, {2, 3}, {3, 2}, {3, 4}, {4, 3}, {9, 16}, {16, 9}};
+    private static final int[] LONG_EDGES = {512, 1024, 2048};
 
     private static final class DrawTask {
         final String id = UUID.randomUUID().toString();
@@ -121,15 +131,18 @@ public final class MainActivity extends Activity {
         final Uri reference2;
         final int width;
         final int height;
+        final int aspectIndex;
+        final int resolutionIndex;
         final int steps;
         final long seed;
         final String encoder;
+        final int unetVariant;
         volatile String promptId;
         volatile ComfyClient client;
         volatile boolean cancelRequested;
 
         DrawTask(String server, String prompt, boolean edit, Uri reference, Uri reference2, int width, int height,
-                 int steps, long seed, String encoder) {
+                 int aspectIndex, int resolutionIndex, int steps, long seed, String encoder, int unetVariant) {
             this.server = server;
             this.prompt = prompt;
             this.edit = edit;
@@ -137,9 +150,12 @@ public final class MainActivity extends Activity {
             this.reference2 = reference2;
             this.width = width;
             this.height = height;
+            this.aspectIndex = aspectIndex;
+            this.resolutionIndex = resolutionIndex;
             this.steps = steps;
             this.seed = seed;
             this.encoder = encoder;
+            this.unetVariant = unetVariant;
         }
     }
 
@@ -263,10 +279,25 @@ public final class MainActivity extends Activity {
         clearReference2.setOnClickListener(v -> clearReference(2));
 
         options.addView(label("画幅（文生图）"));
-        sizeField = spinner(new String[]{"正方形 1024 × 1024", "竖幅 4:5  832 × 1040", "竖幅 9:16  720 × 1280", "横幅 16:9  1280 × 720"});
-        options.addView(sizeField);
+        aspectField = spinner(ASPECT_NAMES);
+        options.addView(aspectField);
+        options.addView(label("分辨率（文生图）"));
+        resolutionField = spinner(new String[0]);
+        options.addView(resolutionField);
+        aspectField.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                updateResolutionChoices();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) { }
+        });
+        updateResolutionChoices();
+        options.addView(label("UNet 模型"));
+        unetField = spinner(new String[]{"标准 INT8", "Uncensored INT8 ConvRot"});
+        unetField.setSelection(1);
+        options.addView(unetField);
         options.addView(label("文字编码器"));
         encoderField = spinner(new String[]{"标准 W4A8", "Heretic W4A8"});
+        encoderField.setSelection(1);
         options.addView(encoderField);
 
         LinearLayout advanced = new LinearLayout(this);
@@ -276,8 +307,8 @@ public final class MainActivity extends Activity {
         stepsBox.setOrientation(LinearLayout.VERTICAL);
         advanced.addView(stepsBox, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         stepsBox.addView(label("步数"));
-        stepsField = field("25", 1);
-        stepsField.setText("25");
+        stepsField = field("30", 1);
+        stepsField.setText("30");
         stepsField.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
         stepsBox.addView(stepsField);
         LinearLayout seedBox = new LinearLayout(this);
@@ -295,7 +326,8 @@ public final class MainActivity extends Activity {
                 int visibility = position == 1 ? View.VISIBLE : View.GONE;
                 referenceBox.setVisibility(visibility);
                 referenceBox2.setVisibility(visibility);
-                sizeField.setEnabled(position == 0);
+                aspectField.setEnabled(position == 0);
+                resolutionField.setEnabled(position == 0);
             }
             @Override public void onNothingSelected(AdapterView<?> parent) { }
         });
@@ -352,6 +384,7 @@ public final class MainActivity extends Activity {
         resultView.setBackground(roundRect(Color.rgb(238, 241, 247), 12));
         resultView.setMinimumHeight(dp(180));
         resultCard.addView(resultView, new LinearLayout.LayoutParams(-1, -2));
+        resultView.setOnClickListener(v -> openResultPreview());
         saveButton = button("保存到手机相册", false);
         updateSaveButton();
         resultCard.addView(saveButton);
@@ -394,6 +427,30 @@ public final class MainActivity extends Activity {
             tabs[i].setTextColor(selected ? Color.WHITE : SUBTLE);
             tabs[i].setBackground(roundRect(selected ? BLUE : Color.TRANSPARENT, 12));
         }
+    }
+
+    private static int[] dimensions(int aspectIndex, int resolutionIndex) {
+        int[] ratio = ASPECTS[aspectIndex];
+        int longEdge = LONG_EDGES[resolutionIndex];
+        int largest = Math.max(ratio[0], ratio[1]);
+        int width = Math.max(32, Math.round(longEdge * ratio[0] / (float) largest / 32) * 32);
+        int height = Math.max(32, Math.round(longEdge * ratio[1] / (float) largest / 32) * 32);
+        return new int[]{width, height};
+    }
+
+    private void updateResolutionChoices() {
+        if (resolutionField == null) return;
+        int aspect = Math.max(0, aspectField.getSelectedItemPosition());
+        int previous = resolutionField.getSelectedItemPosition();
+        String[] labels = new String[LONG_EDGES.length];
+        for (int i = 0; i < labels.length; i++) {
+            int[] size = dimensions(aspect, i);
+            labels[i] = new String[]{"0.5K", "1K", "2K"}[i] + " · " + size[0] + " × " + size[1];
+        }
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        resolutionField.setAdapter(adapter);
+        resolutionField.setSelection(previous < 0 ? 1 : previous);
     }
 
     private void updatePromptPreview() {
@@ -552,14 +609,16 @@ public final class MainActivity extends Activity {
             Toast.makeText(this, "步数须为 1–100，种子须为非负整数", Toast.LENGTH_LONG).show();
             return;
         }
-        int[][] sizes = {{1024, 1024}, {832, 1040}, {720, 1280}, {1280, 720}};
-        int[] size = sizes[sizeField.getSelectedItemPosition()];
+        int aspectIndex = aspectField.getSelectedItemPosition();
+        int resolutionIndex = resolutionField.getSelectedItemPosition();
+        int[] size = dimensions(aspectIndex, resolutionIndex);
         String encoder = encoderField.getSelectedItemPosition() == 0
                 ? "qwen3vl_8b_w4a8.safetensors" : "qwen3vl_8b_w4a8_heretic.safetensors";
         getPreferences(MODE_PRIVATE).edit().putString("server", server).apply();
         requestNotificationPermission();
         pendingTasks.add(new DrawTask(server, prompt, edit, referenceImage, edit ? referenceImage2 : null,
-                size[0], size[1], steps, seed, encoder));
+                size[0], size[1], aspectIndex, resolutionIndex, steps, seed, encoder,
+                unetField.getSelectedItemPosition() == 1 ? 2 : 0));
         refreshQueue();
         setStatus("已加入队列 · 等待 " + pendingTasks.size() + " 个任务");
         startNextIfIdle();
@@ -584,7 +643,7 @@ public final class MainActivity extends Activity {
             ComfyClient client = new ComfyClient(this, task.server);
             task.client = client;
             byte[] image = client.generate(task.edit, task.prompt, task.reference, task.reference2,
-                    task.width, task.height, task.steps, task.seed, task.encoder,
+                    task.width, task.height, task.steps, task.seed, task.encoder, task.unetVariant,
                     new ComfyClient.StatusListener() {
                         @Override public void update(String value) {
                             runOnUiThread(() -> { if (activeTask == task) setStatus(value); });
@@ -606,7 +665,9 @@ public final class MainActivity extends Activity {
             if (bitmap == null) throw new IllegalStateException("返回的文件不是有效图片");
             ResultHistory.Entry entry = null;
             String historyError = null;
-            try { entry = history.add(task.prompt, task.seed, task.edit, image); }
+            try { entry = history.add(task.server, task.prompt, task.edit, task.reference, task.reference2,
+                    task.width, task.height, task.aspectIndex, task.resolutionIndex,
+                    task.steps, task.seed, task.encoder, task.unetVariant, image); }
             catch (Exception e) { historyError = message(e); }
             ResultHistory.Entry savedEntry = entry;
             String saveError = historyError;
@@ -707,7 +768,14 @@ public final class MainActivity extends Activity {
     private String taskSummary(DrawTask task) {
         String shortPrompt = task.prompt.replace('\n', ' ');
         if (shortPrompt.length() > 24) shortPrompt = shortPrompt.substring(0, 24) + "…";
-        return (task.edit ? "图生图" : "文生图") + " · " + shortPrompt;
+        return (task.edit ? "图生图" : "文生图") + " · "
+                + unetLabel(task.unetVariant) + " · " + shortPrompt;
+    }
+
+    private static String unetLabel(int variant) {
+        if (variant == 1) return "GGUF";
+        if (variant == 2) return "Uncensored INT8";
+        return "标准 INT8";
     }
 
     private boolean onPendingDrag(View view, DragEvent event) {
@@ -749,10 +817,20 @@ public final class MainActivity extends Activity {
     }
 
     private void openImagePicker(int requestCode) {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("image/*");
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        Intent intent;
+        if (Build.VERSION.SDK_INT >= 33) {
+            intent = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            intent.setType("image/*");
+        } else {
+            intent = new Intent(Intent.ACTION_PICK);
+            intent.setDataAndType(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*");
+        }
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        if (intent.resolveActivity(getPackageManager()) == null) {
+            intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.setType("image/*");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        }
         startActivityForResult(intent, requestCode);
     }
 
@@ -761,20 +839,22 @@ public final class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if ((requestCode == PICK_IMAGE || requestCode == PICK_IMAGE_2)
                 && resultCode == RESULT_OK && data != null && data.getData() != null) {
-            Uri uri = data.getData();
-            try {
-                getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } catch (SecurityException ignored) {
-                // Some document providers grant access only for the current session.
-            }
-            if (requestCode == PICK_IMAGE) referenceImage = uri;
-            else referenceImage2 = uri;
-            TextView label = requestCode == PICK_IMAGE ? pickedLabel : pickedLabel2;
-            ImageView preview = requestCode == PICK_IMAGE ? referencePreview : referencePreview2;
-            label.setText("正在载入预览…");
-            preview.setVisibility(View.GONE);
-            previewWorker.execute(() -> loadReferencePreview(uri, requestCode, preview, label));
+            setReference(data.getData(), requestCode);
         }
+    }
+
+    private void setReference(Uri uri, int requestCode) {
+        if (uri == null) {
+            clearReference(requestCode == PICK_IMAGE ? 1 : 2);
+            return;
+        }
+        if (requestCode == PICK_IMAGE) referenceImage = uri;
+        else referenceImage2 = uri;
+        TextView label = requestCode == PICK_IMAGE ? pickedLabel : pickedLabel2;
+        ImageView preview = requestCode == PICK_IMAGE ? referencePreview : referencePreview2;
+        label.setText("正在载入预览…");
+        preview.setVisibility(View.GONE);
+        previewWorker.execute(() -> loadReferencePreview(uri, requestCode, preview, label));
     }
 
     private ImageView imagePreview(LinearLayout parent) {
@@ -911,7 +991,7 @@ public final class MainActivity extends Activity {
             ArrayList<ResultHistory.Entry> loaded = history.load();
             runOnUiThread(() -> {
                 for (ResultHistory.Entry entry : loaded) {
-                    boolean present = false;
+                    boolean present = removedHistoryIds.contains(entry.id);
                     for (ResultHistory.Entry current : resultHistory) {
                         if (current.id.equals(entry.id)) { present = true; break; }
                     }
@@ -927,6 +1007,7 @@ public final class MainActivity extends Activity {
 
     private void refreshHistory() {
         historyContainer.removeAllViews();
+        openHistoryRow = null;
         if (resultHistory.isEmpty()) {
             historyContainer.addView(text("暂无已完成的任务", 13, SUBTLE, false));
             return;
@@ -937,17 +1018,157 @@ public final class MainActivity extends Activity {
             String prompt = entry.prompt.replace('\n', ' ');
             if (prompt.length() > 60) prompt = prompt.substring(0, 60) + "…";
             Date date = new Date(entry.createdAt);
+            FrameLayout cell = new FrameLayout(this);
+            LinearLayout.LayoutParams cellParams = new LinearLayout.LayoutParams(-1, -2);
+            cellParams.bottomMargin = dp(6);
+            historyContainer.addView(cell, cellParams);
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(dp(164), -1,
+                    android.view.Gravity.END);
+            cell.addView(actions, actionParams);
+            TextView reuse = text("复用参数", 13, Color.WHITE, true);
+            reuse.setGravity(android.view.Gravity.CENTER);
+            reuse.setBackground(roundRect(entry.reusable ? BLUE : SUBTLE, 9));
+            reuse.setEnabled(entry.reusable);
+            actions.addView(reuse, new LinearLayout.LayoutParams(dp(94), -1));
+            reuse.setOnClickListener(v -> reuseHistory(entry));
+            TextView remove = text("移除", 13, Color.WHITE, true);
+            remove.setGravity(android.view.Gravity.CENTER);
+            remove.setBackground(roundRect(Color.rgb(202, 58, 67), 9));
+            LinearLayout.LayoutParams removeParams = new LinearLayout.LayoutParams(dp(66), -1);
+            removeParams.leftMargin = dp(4);
+            actions.addView(remove, removeParams);
+            remove.setOnClickListener(v -> {
+                remove.setEnabled(false);
+                removeHistory(entry);
+            });
             TextView row = text(dateFormat.format(date) + " " + timeFormat.format(date)
-                    + " · " + (entry.edit ? "图生图" : "文生图") + " · 种子 " + entry.seed
-                    + "\n" + prompt, 13, INK, false);
+                    + " · " + (entry.edit ? "图生图" : "文生图")
+                    + " · " + unetLabel(entry.unetVariant) + " · 种子 " + entry.seed
+                    + "\n" + prompt + (entry.reusable ? "" : "\n旧记录缺少完整参数，不能复用"),
+                    13, INK, false);
             row.setPadding(dp(12), dp(10), dp(12), dp(10));
             row.setBackground(roundRect(entry == selectedResult ? Color.rgb(220, 230, 255)
                     : Color.rgb(238, 242, 250), 9));
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-            params.bottomMargin = dp(6);
-            historyContainer.addView(row, params);
-            row.setOnClickListener(v -> selectResult(entry));
+            cell.addView(row, new FrameLayout.LayoutParams(-1, -2));
+            row.setOnTouchListener(new View.OnTouchListener() {
+                float startX;
+                float startY;
+                float initialOffset;
+                boolean dragging;
+                @Override public boolean onTouch(View view, MotionEvent event) {
+                    if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                        row.animate().cancel();
+                        startX = event.getRawX();
+                        startY = event.getRawY();
+                        initialOffset = row.getTranslationX();
+                        dragging = false;
+                        return true;
+                    }
+                    if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                        float delta = event.getRawX() - startX;
+                        float vertical = event.getRawY() - startY;
+                        if (!dragging && Math.abs(delta) > dp(8)
+                                && Math.abs(delta) > Math.abs(vertical)) {
+                            dragging = true;
+                            cell.getParent().requestDisallowInterceptTouchEvent(true);
+                        }
+                        if (dragging) row.setTranslationX(Math.max(-dp(164),
+                                Math.min(0, initialOffset + delta)));
+                        return true;
+                    }
+                    if (event.getAction() == MotionEvent.ACTION_UP) {
+                        cell.getParent().requestDisallowInterceptTouchEvent(false);
+                        if (!dragging) selectResult(entry);
+                        else {
+                            boolean opened = row.getTranslationX() < -dp(82);
+                            if (opened && openHistoryRow != null && openHistoryRow != row)
+                                openHistoryRow.animate().translationX(0).setDuration(150).start();
+                            row.animate().translationX(opened ? -dp(164) : 0).setDuration(150).start();
+                            openHistoryRow = opened ? row : null;
+                        }
+                        return true;
+                    }
+                    if (event.getAction() == MotionEvent.ACTION_CANCEL) {
+                        cell.getParent().requestDisallowInterceptTouchEvent(false);
+                        row.animate().translationX(initialOffset).setDuration(150).start();
+                        return true;
+                    }
+                    return false;
+                }
+            });
         }
+    }
+
+    private void removeHistory(ResultHistory.Entry entry) {
+        saveWorker.execute(() -> {
+            try {
+                history.remove(entry);
+                runOnUiThread(() -> {
+                    removedHistoryIds.add(entry.id);
+                    resultHistory.remove(entry);
+                    if (selectedResult == entry) {
+                        resultSelectionVersion++;
+                        selectedResult = null;
+                        latestImage = null;
+                        resultView.setImageDrawable(null);
+                        updateSaveButton();
+                        setStatus("历史任务已移除");
+                    }
+                    refreshHistory();
+                    Toast.makeText(this, "已移除软件内的历史任务", Toast.LENGTH_SHORT).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    refreshHistory();
+                    Toast.makeText(this, "移除失败：" + message(e), Toast.LENGTH_LONG).show();
+                });
+            }
+        });
+    }
+
+    private void reuseHistory(ResultHistory.Entry entry) {
+        if (!entry.reusable) return;
+        previewWorker.execute(() -> {
+            FileReference copies = new FileReference();
+            try {
+                copies.first = history.copyReferenceForReuse(entry.reference);
+                copies.second = history.copyReferenceForReuse(entry.reference2);
+                runOnUiThread(() -> applyHistoryParameters(entry, copies));
+            } catch (Exception e) {
+                if (copies.first != null) copies.first.delete();
+                if (copies.second != null) copies.second.delete();
+                runOnUiThread(() -> Toast.makeText(this,
+                        "复用失败：" + message(e), Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    private static final class FileReference {
+        java.io.File first;
+        java.io.File second;
+    }
+
+    private void applyHistoryParameters(ResultHistory.Entry entry, FileReference copies) {
+        serverField.setText(entry.server);
+        promptText = entry.prompt;
+        promptSelection = promptText.length();
+        getPreferences(MODE_PRIVATE).edit().putString("prompt_draft", promptText).apply();
+        updatePromptPreview();
+        modeField.setSelection(entry.edit ? 1 : 0);
+        aspectField.setSelection(entry.aspectIndex);
+        updateResolutionChoices();
+        resolutionField.setSelection(entry.resolutionIndex);
+        stepsField.setText(String.valueOf(entry.steps));
+        seedField.setText(String.valueOf(entry.seed));
+        encoderField.setSelection(entry.encoder.contains("heretic") ? 1 : 0);
+        unetField.setSelection(entry.unetVariant == 2 ? 1 : 0);
+        setReference(copies.first == null ? null : Uri.fromFile(copies.first), PICK_IMAGE);
+        setReference(copies.second == null ? null : Uri.fromFile(copies.second), PICK_IMAGE_2);
+        selectTab(0);
+        createPage.smoothScrollTo(0, 0);
+        Toast.makeText(this, "已回填任务参数", Toast.LENGTH_SHORT).show();
     }
 
     private void selectResult(ResultHistory.Entry entry) {
@@ -987,6 +1208,36 @@ public final class MainActivity extends Activity {
                 || options.outHeight / options.inSampleSize > 1600) options.inSampleSize *= 2;
         options.inJustDecodeBounds = false;
         return BitmapFactory.decodeByteArray(image, 0, image.length, options);
+    }
+
+    private void openResultPreview() {
+        byte[] image = latestImage;
+        if (image == null) return;
+        Dialog dialog = new Dialog(this);
+        FrameLayout frame = new FrameLayout(this);
+        frame.setBackgroundColor(Color.BLACK);
+        ImageView preview = new ImageView(this);
+        preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        frame.addView(preview, new FrameLayout.LayoutParams(-1, -1));
+        TextView close = text("关闭", 16, Color.WHITE, true);
+        close.setGravity(android.view.Gravity.CENTER);
+        FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(dp(64), dp(48),
+                android.view.Gravity.TOP | android.view.Gravity.END);
+        closeParams.setMargins(0, dp(12), dp(12), 0);
+        frame.addView(close, closeParams);
+        close.setOnClickListener(v -> dialog.dismiss());
+        dialog.setContentView(frame);
+        dialog.show();
+        android.view.Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.BLACK));
+            window.setLayout(-1, -1);
+            window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN);
+        }
+        previewWorker.execute(() -> {
+            Bitmap bitmap = BitmapFactory.decodeByteArray(image, 0, image.length);
+            runOnUiThread(() -> { if (dialog.isShowing()) preview.setImageBitmap(bitmap); });
+        });
     }
 
     private void setStatus(String value) { statusLabel.setText(value); }
