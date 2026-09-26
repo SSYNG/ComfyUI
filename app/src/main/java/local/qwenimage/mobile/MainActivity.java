@@ -2,6 +2,12 @@ package local.qwenimage.mobile;
 
 import android.app.Activity;
 import android.app.Dialog;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.content.ContentValues;
 import android.content.ClipData;
 import android.content.Intent;
@@ -13,6 +19,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.text.Editable;
@@ -33,7 +40,10 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.OutputStream;
+import java.nio.file.Files;
+import java.text.DateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -41,6 +51,9 @@ import java.util.concurrent.Executors;
 public final class MainActivity extends Activity {
     private static final int PICK_IMAGE = 1001;
     private static final int PICK_IMAGE_2 = 1002;
+    private static final int NOTIFICATION_PERMISSION = 1003;
+    private static final String COMPLETED_CHANNEL = "completed_tasks";
+    private static final String SHOW_TASKS = "local.qwenimage.mobile.SHOW_TASKS";
     private static final int INK = Color.rgb(25, 35, 58);
     private static final int SUBTLE = Color.rgb(104, 115, 136);
     private static final int BLUE = Color.rgb(38, 82, 211);
@@ -48,7 +61,9 @@ public final class MainActivity extends Activity {
     private final ExecutorService connectionWorker = Executors.newSingleThreadExecutor();
     private final ExecutorService controlWorker = Executors.newSingleThreadExecutor();
     private final ExecutorService previewWorker = Executors.newSingleThreadExecutor();
+    private final ExecutorService saveWorker = Executors.newSingleThreadExecutor();
     private final ArrayList<DrawTask> pendingTasks = new ArrayList<>();
+    private final ArrayList<ResultHistory.Entry> resultHistory = new ArrayList<>();
 
     private EditText serverField;
     private TextView promptPreview;
@@ -78,6 +93,7 @@ public final class MainActivity extends Activity {
     private LinearLayout progressCard;
     private LinearLayout pendingContainer;
     private LinearLayout activeContainer;
+    private LinearLayout historyContainer;
     private ImageView resultView;
     private ImageView referencePreview;
     private ImageView referencePreview2;
@@ -90,6 +106,10 @@ public final class MainActivity extends Activity {
     private Uri referenceImage;
     private Uri referenceImage2;
     private byte[] latestImage;
+    private ResultHistory.Entry selectedResult;
+    private ResultHistory history;
+    private boolean savingImage;
+    private int resultSelectionVersion;
     private DrawTask activeTask;
 
     private static final class DrawTask {
@@ -128,7 +148,18 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         promptText = getPreferences(MODE_PRIVATE).getString("prompt_draft", "");
+        history = new ResultHistory(this);
+        createNotificationChannel();
         buildScreen();
+        if (SHOW_TASKS.equals(getIntent().getAction())) selectTab(1);
+        loadHistory();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (SHOW_TASKS.equals(intent.getAction())) selectTab(1);
     }
 
     private void buildScreen() {
@@ -199,9 +230,6 @@ public final class MainActivity extends Activity {
         promptCount = text("", 12, SUBTLE, false);
         promptCount.setPadding(0, dp(5), 0, 0);
         options.addView(promptCount);
-        Button editPromptButton = button("全屏编辑提示词", false);
-        options.addView(editPromptButton);
-        editPromptButton.setOnClickListener(v -> openPromptEditor());
         updatePromptPreview();
 
         referenceBox = new LinearLayout(this);
@@ -314,7 +342,7 @@ public final class MainActivity extends Activity {
         pendingContainer.setOnDragListener(this::onPendingDrag);
 
         LinearLayout resultCard = card(jobsContent);
-        resultCard.addView(label("结果"));
+        resultCard.addView(label("选中的结果"));
         statusLabel = text("等待提交任务", 14, SUBTLE, false);
         statusLabel.setPadding(0, dp(8), 0, dp(12));
         resultCard.addView(statusLabel);
@@ -325,9 +353,18 @@ public final class MainActivity extends Activity {
         resultView.setMinimumHeight(dp(180));
         resultCard.addView(resultView, new LinearLayout.LayoutParams(-1, -2));
         saveButton = button("保存到手机相册", false);
-        saveButton.setEnabled(false);
+        updateSaveButton();
         resultCard.addView(saveButton);
         saveButton.setOnClickListener(v -> saveImage());
+
+        LinearLayout historyCard = card(jobsContent);
+        historyCard.addView(label("任务历史"));
+        TextView historyHint = text("成功生成的图片保存在本机，点击记录可查看并保存到相册。", 13, SUBTLE, false);
+        historyHint.setPadding(0, 0, 0, dp(8));
+        historyCard.addView(historyHint);
+        historyContainer = new LinearLayout(this);
+        historyContainer.setOrientation(LinearLayout.VERTICAL);
+        historyCard.addView(historyContainer);
 
         setContentView(root);
         selectTab(serverField.getText().length() == 0 ? 2 : 0);
@@ -379,6 +416,10 @@ public final class MainActivity extends Activity {
         layout.addView(toolbar);
         TextView heading = text("编辑提示词", 20, INK, true);
         toolbar.addView(heading, new LinearLayout.LayoutParams(0, dp(44), 1));
+        TextView clear = text("清空", 16, SUBTLE, true);
+        clear.setGravity(android.view.Gravity.CENTER);
+        clear.setPadding(dp(8), 0, dp(8), 0);
+        toolbar.addView(clear, new LinearLayout.LayoutParams(-2, dp(44)));
         TextView done = text("完成", 16, BLUE, true);
         done.setGravity(android.view.Gravity.CENTER);
         done.setPadding(dp(16), 0, dp(8), 0);
@@ -402,6 +443,7 @@ public final class MainActivity extends Activity {
         editor.setLineSpacing(dp(3), 1f);
         editor.setText(promptText);
         editor.setSelection(Math.min(promptSelection, editor.length()));
+        clear.setOnClickListener(v -> editor.setText(""));
         layout.addView(editor, new LinearLayout.LayoutParams(-1, 0, 1));
         counter.setText(editor.length() + " 字 · 关闭编辑器后保存在本机");
         editor.addTextChangedListener(new TextWatcher() {
@@ -515,6 +557,7 @@ public final class MainActivity extends Activity {
         String encoder = encoderField.getSelectedItemPosition() == 0
                 ? "qwen3vl_8b_w4a8.safetensors" : "qwen3vl_8b_w4a8_heretic.safetensors";
         getPreferences(MODE_PRIVATE).edit().putString("server", server).apply();
+        requestNotificationPermission();
         pendingTasks.add(new DrawTask(server, prompt, edit, referenceImage, edit ? referenceImage2 : null,
                 size[0], size[1], steps, seed, encoder));
         refreshQueue();
@@ -559,15 +602,29 @@ public final class MainActivity extends Activity {
                         @Override public boolean isCanceled() { return task.cancelRequested; }
                     });
             if (task.cancelRequested) throw new InterruptedException("任务已取消");
-            Bitmap bitmap = BitmapFactory.decodeByteArray(image, 0, image.length);
+            Bitmap bitmap = previewBitmap(image);
             if (bitmap == null) throw new IllegalStateException("返回的文件不是有效图片");
+            ResultHistory.Entry entry = null;
+            String historyError = null;
+            try { entry = history.add(task.prompt, task.seed, task.edit, image); }
+            catch (Exception e) { historyError = message(e); }
+            ResultHistory.Entry savedEntry = entry;
+            String saveError = historyError;
             runOnUiThread(() -> {
                 if (activeTask != task) return;
+                resultSelectionVersion++;
                 latestImage = image;
+                selectedResult = savedEntry;
                 resultView.setImageBitmap(bitmap);
-                saveButton.setEnabled(true);
+                updateSaveButton();
+                if (savedEntry != null) {
+                    resultHistory.add(0, savedEntry);
+                    refreshHistory();
+                }
                 showStage("完成", 100, "图片已生成", 0);
-                setStatus("完成 · 种子 " + task.seed);
+                setStatus(saveError == null ? "完成 · 种子 " + task.seed
+                        : "图片已生成，但保存任务历史失败：" + saveError);
+                notifyTaskCompleted(task);
                 finishTask(task);
             });
         } catch (Exception e) {
@@ -772,26 +829,164 @@ public final class MainActivity extends Activity {
 
     private void saveImage() {
         byte[] image = latestImage;
-        if (image == null) return;
-        worker.execute(() -> {
+        if (image == null || savingImage) return;
+        savingImage = true;
+        updateSaveButton();
+        saveWorker.execute(() -> {
             Uri output = null;
             try {
                 ContentValues values = new ContentValues();
-                values.put(MediaStore.Images.Media.DISPLAY_NAME, "TangHua_" + System.currentTimeMillis() + ".png");
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, "TangHua_" + UUID.randomUUID() + ".png");
                 values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
                 values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/躺画");
+                values.put(MediaStore.Images.Media.IS_PENDING, 1);
                 output = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
                 if (output == null) throw new IllegalStateException("相册无法创建文件");
                 try (OutputStream stream = getContentResolver().openOutputStream(output)) {
                     if (stream == null) throw new IllegalStateException("相册无法写入文件");
                     stream.write(image);
                 }
-                runOnUiThread(() -> Toast.makeText(this, "已保存到相册", Toast.LENGTH_SHORT).show());
+                ContentValues ready = new ContentValues();
+                ready.put(MediaStore.Images.Media.IS_PENDING, 0);
+                getContentResolver().update(output, ready, null, null);
+                runOnUiThread(() -> finishSaving("已保存到相册"));
             } catch (Exception e) {
                 if (output != null) getContentResolver().delete(output, null, null);
-                runOnUiThread(() -> setStatus("保存失败：" + message(e)));
+                runOnUiThread(() -> finishSaving("保存失败：" + message(e)));
             }
         });
+    }
+
+    private void finishSaving(String feedback) {
+        savingImage = false;
+        updateSaveButton();
+        Toast.makeText(this, feedback, Toast.LENGTH_LONG).show();
+    }
+
+    private void createNotificationChannel() {
+        NotificationChannel channel = new NotificationChannel(COMPLETED_CHANNEL, "任务完成",
+                NotificationManager.IMPORTANCE_DEFAULT);
+        channel.setDescription("新图片生成完成时提醒");
+        getSystemService(NotificationManager.class).createNotificationChannel(channel);
+    }
+
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < 33
+                || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                || getPreferences(MODE_PRIVATE).getBoolean("notification_permission_requested", false)) return;
+        getPreferences(MODE_PRIVATE).edit().putBoolean("notification_permission_requested", true).apply();
+        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION);
+    }
+
+    private void notifyTaskCompleted(DrawTask task) {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return;
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.setAction(SHOW_TASKS);
+        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent openTasks = PendingIntent.getActivity(this, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        int icon = getResources().getIdentifier("ic_notification", "drawable", getPackageName());
+        Notification notification = new Notification.Builder(this, COMPLETED_CHANNEL)
+                .setSmallIcon(icon)
+                .setContentTitle("绘图完成")
+                .setContentText(taskSummary(task))
+                .setContentIntent(openTasks)
+                .setAutoCancel(true)
+                .build();
+        getSystemService(NotificationManager.class).notify(task.id.hashCode(), notification);
+    }
+
+    private void updateSaveButton() {
+        boolean enabled = latestImage != null && !savingImage;
+        saveButton.setEnabled(enabled);
+        saveButton.setText(savingImage ? "正在保存…" : "保存到手机相册");
+        saveButton.setTextColor(enabled ? BLUE : SUBTLE);
+        saveButton.setBackground(roundRect(enabled ? Color.rgb(232, 237, 250)
+                : Color.rgb(230, 232, 237), 12));
+    }
+
+    private void loadHistory() {
+        previewWorker.execute(() -> {
+            ArrayList<ResultHistory.Entry> loaded = history.load();
+            runOnUiThread(() -> {
+                for (ResultHistory.Entry entry : loaded) {
+                    boolean present = false;
+                    for (ResultHistory.Entry current : resultHistory) {
+                        if (current.id.equals(entry.id)) { present = true; break; }
+                    }
+                    if (!present) resultHistory.add(entry);
+                }
+                resultHistory.sort((a, b) -> Long.compare(b.createdAt, a.createdAt));
+                refreshHistory();
+                if (!resultHistory.isEmpty() && selectedResult == null && latestImage == null)
+                    selectResult(resultHistory.get(0));
+            });
+        });
+    }
+
+    private void refreshHistory() {
+        historyContainer.removeAllViews();
+        if (resultHistory.isEmpty()) {
+            historyContainer.addView(text("暂无已完成的任务", 13, SUBTLE, false));
+            return;
+        }
+        DateFormat dateFormat = android.text.format.DateFormat.getDateFormat(this);
+        DateFormat timeFormat = android.text.format.DateFormat.getTimeFormat(this);
+        for (ResultHistory.Entry entry : resultHistory) {
+            String prompt = entry.prompt.replace('\n', ' ');
+            if (prompt.length() > 60) prompt = prompt.substring(0, 60) + "…";
+            Date date = new Date(entry.createdAt);
+            TextView row = text(dateFormat.format(date) + " " + timeFormat.format(date)
+                    + " · " + (entry.edit ? "图生图" : "文生图") + " · 种子 " + entry.seed
+                    + "\n" + prompt, 13, INK, false);
+            row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            row.setBackground(roundRect(entry == selectedResult ? Color.rgb(220, 230, 255)
+                    : Color.rgb(238, 242, 250), 9));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+            params.bottomMargin = dp(6);
+            historyContainer.addView(row, params);
+            row.setOnClickListener(v -> selectResult(entry));
+        }
+    }
+
+    private void selectResult(ResultHistory.Entry entry) {
+        int version = ++resultSelectionVersion;
+        selectedResult = entry;
+        latestImage = null;
+        updateSaveButton();
+        resultView.setImageDrawable(null);
+        setStatus("正在读取历史图片…");
+        refreshHistory();
+        previewWorker.execute(() -> {
+            try {
+                byte[] image = Files.readAllBytes(entry.image.toPath());
+                Bitmap bitmap = previewBitmap(image);
+                if (bitmap == null) throw new IllegalStateException("图片文件已损坏");
+                runOnUiThread(() -> {
+                    if (version != resultSelectionVersion) return;
+                    latestImage = image;
+                    resultView.setImageBitmap(bitmap);
+                    updateSaveButton();
+                    setStatus("历史结果 · 种子 " + entry.seed);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (version == resultSelectionVersion) setStatus("读取历史图片失败：" + message(e));
+                });
+            }
+        });
+    }
+
+    private static Bitmap previewBitmap(byte[] image) {
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(image, 0, image.length, options);
+        options.inSampleSize = 1;
+        while (options.outWidth / options.inSampleSize > 1600
+                || options.outHeight / options.inSampleSize > 1600) options.inSampleSize *= 2;
+        options.inJustDecodeBounds = false;
+        return BitmapFactory.decodeByteArray(image, 0, image.length, options);
     }
 
     private void setStatus(String value) { statusLabel.setText(value); }
@@ -874,6 +1069,7 @@ public final class MainActivity extends Activity {
         connectionWorker.shutdownNow();
         controlWorker.shutdownNow();
         previewWorker.shutdownNow();
+        saveWorker.shutdown();
         super.onDestroy();
     }
 }
